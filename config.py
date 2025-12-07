@@ -24,13 +24,13 @@ ROI_POINTS_SRC = np.float32([
     [0.44, 0.46]   # Top Left
 ])
 
-<<<<<<< HEAD
+
 # 单车道检测时的默认偏移量 (当只检测到一侧车道线时，假设另一侧的距离)
 SINGLE_LANE_OFFSET = 250
 
 # 之前的矩形配置作废，保留此变量防止报错，但逻辑会改用上面的 POLY
 CAR_HOOD_MASK_RATIO = [0.0, 0.0, 0.0, 0.0]
-=======
+
 # ================= Car Body Mask (Trapezoid) =================
 CAR_MASK_POLY = np.float32([
     [0.35, 0.55],  # Top Left
@@ -63,4 +63,4 @@ MAX_KEY_DURATION = 0.3
 # ================= Smoothing Config =================
 CENTER_THRESHOLD = 50
 SMOOTH_WINDOW = 5
->>>>>>> ace3bcae962f6d66a4e118fb5839768d5f6681f4
+

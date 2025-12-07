@@ -11,36 +11,38 @@ class YOLOPService:
         self.device = device
         self.input_width = 640
         self.input_height = 640
-        self.use_torch = False
         
-        # 检查模型文件
+        # 核心修复：根据文件扩展名决定加载方式
+        if model_path.endswith('.pt'):
+            self.use_torch = True
+        else:
+            self.use_torch = False
+
+        # 如果使用 PyTorch
+        if self.use_torch:
+            print(f"ℹ️ 检测到 .pt 文件，将使用 PyTorch (TorchScript) 模式。")
+            if not os.path.exists(model_path):
+                 print(f"❌ 错误: 指定的 TorchScript 模型文件不存在: {model_path}")
+                 raise FileNotFoundError(f"Model file not found: {model_path}")
+            try:
+                self.model = torch.jit.load(model_path)
+                if device == 'cuda' and torch.cuda.is_available():
+                    self.model = self.model.cuda()
+                    print("🧠 YOLOPv2 Service (TorchScript) ... Device: CUDA")
+                else:
+                    self.model = self.model.cpu()
+                    print("🧠 YOLOPv2 Service (TorchScript) ... Device: CPU")
+                self.model.eval()
+                return # PyTorch 初始化完成
+            except Exception as e:
+                print(f"❌ 加载 TorchScript 模型失败: {e}")
+                raise e
+
+        # 如果使用 ONNX (原逻辑)
         if not os.path.exists(model_path):
-            # 检查是否存在 .pt 文件 (TorchScript)
-            pt_path = model_path.replace('.onnx', '.pt')
-            if os.path.exists(pt_path):
-                print(f"⚠️ 未找到 ONNX 模型，但检测到 TorchScript 模型: {pt_path}")
-                print("🔄 切换到 PyTorch 推理模式...")
-                self.use_torch = True
-                self.model_path = pt_path
-                
-                try:
-                    self.model = torch.jit.load(pt_path)
-                    if device == 'cuda' and torch.cuda.is_available():
-                        self.model = self.model.cuda()
-                        print("🧠 YOLOPv2 Service (TorchScript) ... Device: CUDA")
-                    else:
-                        self.model = self.model.cpu()
-                        print("🧠 YOLOPv2 Service (TorchScript) ... Device: CPU")
-                    self.model.eval()
-                    return # 初始化完成
-                except Exception as e:
-                    print(f"❌ 加载 TorchScript 模型失败: {e}")
-                    # 继续尝试下载 ONNX
-            
             print(f"⚠️ 模型 {model_path} 不存在，正在尝试自动下载 ONNX 版本...")
             os.makedirs(os.path.dirname(model_path), exist_ok=True)
             
-            # 尝试多个下载源
             urls = [
                 "https://github.com/ibaiGorordo/ONNX-YOLOP-v2-Lane-Detection/raw/main/models/yolopv2.onnx",
                 "https://github.com/CAIC-AD/YOLOPv2/releases/download/V0.0.1/yolopv2.onnx"
@@ -62,20 +64,19 @@ class YOLOPService:
                 print("请手动下载 'yolopv2.onnx' 并放入 'models/' 文件夹。")
                 raise FileNotFoundError("Model file not found")
 
-        # 初始化 ONNX Runtime (如果不是 Torch 模式)
-        if not self.use_torch:
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
+        # 初始化 ONNX Runtime
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
+        try:
+            self.session = ort.InferenceSession(model_path, providers=providers)
+            print(f"🧠 YOLOPv2 Service (ONNX) ... Device: {device} (Providers: {self.session.get_providers()})")
+        except Exception as e:
+            print(f"⚠️ 无法加载 CUDA 提供程序或模型加载失败，回退到 CPU: {e}")
             try:
-                self.session = ort.InferenceSession(model_path, providers=providers)
-                print(f"🧠 YOLOPv2 Service (ONNX) ... Device: {device} (Providers: {self.session.get_providers()})")
-            except Exception as e:
-                print(f"⚠️ 无法加载 CUDA 提供程序或模型加载失败，回退到 CPU: {e}")
-                try:
-                    self.session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
-                except Exception as e2:
-                    print(f"❌ 严重错误: 无法加载模型。请确保 models/yolopv2.onnx 存在且完整。")
-                    raise e2
-            self.input_name = self.session.get_inputs()[0].name
+                self.session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+            except Exception as e2:
+                print(f"❌ 严重错误: 无法加载模型。请确保 models/yolopv2.onnx 存在且完整。")
+                raise e2
+        self.input_name = self.session.get_inputs()[0].name
 
     def preprocess(self, img):
         self.img_h, self.img_w = img.shape[:2]

@@ -30,7 +30,7 @@ def main():
         
         # 初始化 YOLOPv2 服务 (全能模型：检测+路面+车道线)
         # 首次运行会自动下载模型 (约 180MB)
-        yolop_bot = YOLOPService(model_path='models/yolopv2.onnx', device='cuda')
+        yolop_bot = YOLOPService(model_path='models/yolopv2.pt', device='cuda')
         
         # 控制器
         controller = PIDController(Kp=KP, steering_threshold=STEERING_THRESHOLD, turn_cooldown=TURN_COOLDOWN)
