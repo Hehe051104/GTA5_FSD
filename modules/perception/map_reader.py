@@ -16,53 +16,97 @@ class MapReader:
         x1 = int(w * MINIMAP_ROI_RATIO[2])
         x2 = int(w * MINIMAP_ROI_RATIO[3])
 
-        if y1 >= y2 or x1 >= x2: return 0, None
+        if y1 >= y2 or x1 >= x2: return 0, False, "None", None
 
         minimap = frame[y1:y2, x1:x2]
         map_h, map_w = minimap.shape[:2]
 
         car_center_x = map_w // 2
-        # Adjust car center Y to align with the player arrow (slightly lower than image center)
-        car_center_y = int(map_h * 0.58)
+        # Adjust car center Y to align with the player arrow
+        # Moved up to 0.50 (Center) based on user feedback
+        car_center_y = int(map_h * 0.50)
 
         hsv = cv2.cvtColor(minimap, cv2.COLOR_BGR2HSV)
         
         # 1. Detect Navigation Route (Purple)
-        mask_nav = cv2.inRange(hsv, NAV_COLOR_LOWER, NAV_COLOR_UPPER)
+        mask_nav_full = cv2.inRange(hsv, NAV_COLOR_LOWER, NAV_COLOR_UPPER)
         
-        # --- Optimization: Limit Lookahead (Circular ROI) ---
-        # Only consider the path within a certain radius of the car to avoid distant turns affecting steering
-        # Radius set to 25% of the smaller dimension (Reduced from 35% to focus on immediate path)
-        lookahead_radius = int(min(map_h, map_w) * 0.25) 
-        mask_roi = np.zeros_like(mask_nav)
-        cv2.circle(mask_roi, (car_center_x, car_center_y), lookahead_radius, 255, -1)
-        mask_nav = cv2.bitwise_and(mask_nav, mask_roi)
+        # --- Check if Car is ON Route ---
+        # Check a small radius around the car center to see if it overlaps with the purple line
+        mask_car_check = np.zeros_like(mask_nav_full)
+        cv2.circle(mask_car_check, (car_center_x, car_center_y), 6, 255, -1) # 6px radius
+        on_route_overlap = cv2.bitwise_and(mask_nav_full, mask_car_check)
+        is_on_route = cv2.countNonZero(on_route_overlap) > 0
         
-        kernel = np.ones((3,3), np.uint8)
-        mask_nav = cv2.erode(mask_nav, kernel, iterations=1)
-        mask_nav = cv2.dilate(mask_nav, kernel, iterations=2)
+        # --- Optimization: Smart Turn (Forward Priority) ---
+        # Strategy: "Go Straight First, Then Turn"
+        # 1. Check a narrow strip directly ahead of the car.
+        # 2. If path exists there, follow it (keep straight).
+        # 3. If not, look for the turn using the Pure Pursuit Ring.
         
-        # --- Logic: Only Navigation ---
+        pursuit_radius = int(min(map_h, map_w) * 0.20)
+        
+        # A. Check Forward Path
+        forward_width = 8 # +/- 8 pixels (Total 16px width)
+        mask_forward = np.zeros_like(mask_nav_full)
+        # Rectangle from car center upwards to pursuit radius
+        cv2.rectangle(mask_forward, 
+                      (car_center_x - forward_width, car_center_y - pursuit_radius),
+                      (car_center_x + forward_width, car_center_y),
+                      255, -1)
+        
+        mask_forward_check = cv2.bitwise_and(mask_nav_full, mask_forward)
+        forward_pixels = cv2.countNonZero(mask_forward_check)
+        
         nav_error = None
+        active_mask_points = None
+        mode = "None"
         target_x = car_center_x
         target_y = car_center_y
         
-        # Check for Navigation Route
-        nonzero_nav = cv2.findNonZero(mask_nav)
-        
-        active_mask_points = None
-        mode = "None"
-        
-        if nonzero_nav is not None:
-            active_mask_points = nonzero_nav
-            mode = "Nav (Purple)"
-            # Visualization: Highlight Nav
-            minimap[mask_nav > 0] = [0, 255, 0] # Green overlay for Nav
+        # Threshold: If enough purple pixels are directly ahead
+        if forward_pixels > 20:
+             # --- Mode: Forward Priority ---
+             active_mask_points = cv2.findNonZero(mask_forward_check)
+             mode = "Nav (Forward)"
+             minimap[mask_forward_check > 0] = [0, 255, 0] # Green for Forward
+             
+             # Visual Debug: Show Forward ROI
+             cv2.rectangle(minimap, 
+                      (car_center_x - forward_width, car_center_y - pursuit_radius),
+                      (car_center_x + forward_width, car_center_y),
+                      (100, 255, 100), 1)
+        else:
+             # --- Mode: Turn (Pure Pursuit) ---
+             # No path ahead, so we look for the turn on the ring
+             mask_ring = np.zeros_like(mask_nav_full)
+             cv2.circle(mask_ring, (car_center_x, car_center_y), pursuit_radius, 255, thickness=4)
+             cv2.rectangle(mask_ring, (0, car_center_y + 5), (map_w, map_h), 0, -1) # Upper half only
+             
+             intersect_nav = cv2.bitwise_and(mask_nav_full, mask_ring)
+             points_pursuit = cv2.findNonZero(intersect_nav)
+             
+             if points_pursuit is not None:
+                 active_mask_points = points_pursuit
+                 mode = "Nav (Turn)"
+                 minimap[intersect_nav > 0] = [0, 255, 255] # Yellow for Turn Target
+             else:
+                 # --- Mode: Fallback (Close Range) ---
+                 fallback_radius = int(min(map_h, map_w) * 0.12)
+                 mask_roi = np.zeros_like(mask_nav_full)
+                 cv2.circle(mask_roi, (car_center_x, car_center_y), fallback_radius, 255, -1)
+                 mask_nav_fallback = cv2.bitwise_and(mask_nav_full, mask_roi)
+                 
+                 points_fallback = cv2.findNonZero(mask_nav_fallback)
+                 if points_fallback is not None:
+                     active_mask_points = points_fallback
+                     mode = "Nav (Fallback)"
+                     minimap[mask_nav_fallback > 0] = [0, 0, 255] # Red for Fallback
 
         # Visual Debug Elements
         cv2.line(minimap, (car_center_x, 0), (car_center_x, map_h), (255, 0, 0), 1) # Vertical Center
         cv2.line(minimap, (0, car_center_y), (map_w, car_center_y), (255, 0, 0), 1) # Horizontal Center
-        cv2.circle(minimap, (car_center_x, car_center_y), lookahead_radius, (200, 200, 200), 1) # Lookahead Limit Circle
+        cv2.circle(minimap, (car_center_x, car_center_y), pursuit_radius, (200, 200, 200), 1) # Pursuit Circle
 
         if active_mask_points is not None:
             # Calculate centroid of the path
@@ -103,5 +147,9 @@ class MapReader:
                 # Display Angle
                 cv2.putText(minimap, f"{mode}", (10, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
                 cv2.putText(minimap, f"Ang: {int(angle)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        
+        # Visual feedback for "On Route" status
+        status_color = (0, 255, 0) if is_on_route else (0, 0, 255)
+        cv2.circle(minimap, (car_center_x, car_center_y), 4, status_color, -1)
 
-        return nav_error, minimap
+        return nav_error, is_on_route, mode, minimap

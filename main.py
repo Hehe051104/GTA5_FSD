@@ -106,7 +106,7 @@ def main():
         
         # --- 小地图导航处理 ---
         # 注意：map_bot 需要原始分辨率的帧来截取小地图区域
-        nav_offset, minimap_vis = map_bot.process(raw_frame)
+        nav_offset, is_on_route, nav_mode, minimap_vis = map_bot.process(raw_frame)
         
         # 3. YOLOv8 物体检测
         # 在 YOLOPv2 的结果上叠加检测框
@@ -184,19 +184,40 @@ def main():
         should_cruise = False
         
         if has_map_signal:
-            if has_lane_signal:
-                # 场景1: 正常导航 (有紫线 + 有车道) -> 融合模式
-                # 逻辑：以视觉车道保持为主(70%)，小地图导航为辅(30%)
-                # 这样既能保持视觉的平滑性，又能让小地图在路口提供转向指引
-                final_offset = (offset * 0.7) + (nav_offset * 0.3)
-                nav_source = "Fusion (Lane+Map)"
-                should_cruise = True
-                # 使用中等灵敏度 (介于 20 和 140 之间)，防止过度敏感
-                controller.steering_threshold = 40 
+            # 检查是否处于直行模式 (Forward Mode)
+            # 只有在明确检测到前方有直行路径时，才允许使用视觉车道保持
+            is_forward = "Forward" in nav_mode
+            
+            if not is_forward:
+                 # 场景0: 非直行模式 (Turn / Fallback) -> 强制地图导航
+                 # 此时前方矩形区域无路径，说明即将转向或到达尽头，必须忽略视觉车道保持
+                 final_offset = nav_offset
+                 nav_source = f"Map ({nav_mode})"
+                 should_cruise = True
+                 controller.steering_threshold = STEERING_THRESHOLD_MAP
+            elif has_lane_signal:
+                if is_on_route:
+                    # 场景1.1: 在路线上且前方直行 (On Route + Forward) -> 信任视觉车道保持
+                    # 车辆位于紫色导航线上，且前方有路，优先使用平滑的视觉车道保持
+                    final_offset = offset
+                    nav_source = "Vision (On Route)"
+                    should_cruise = True
+                    controller.steering_threshold = STEERING_THRESHOLD_LANE # 低灵敏度，防画龙
+                else:
+                    # 场景1.2: 偏离路线 (Off Route) -> 导航强力介入
+                    # 车辆不在紫色线上（可能在路口或偏离），使用导航修正
+                    final_offset = (offset * 0.3) + (nav_offset * 0.7)
+                    nav_source = "Map Intervention"
+                    should_cruise = True
+                    controller.steering_threshold = STEERING_THRESHOLD_MAP # 高灵敏度，快速修正
             else:
-                # 场景2: 偏移道路 (有紫线 + 无车道) -> 刹车
-                nav_source = "Map Only (No Lane)"
-                should_cruise = False # Brake
+                # 场景2: 无车道信号 (十字路口/模糊路段)
+                # 只要能看到紫色导航线 (has_map_signal=True)，就应该尝试去追，而不是停车
+                # 无论是否在路线上 (is_on_route)，都应该信任 nav_offset
+                final_offset = nav_offset
+                nav_source = "Map Only (Recovery)"
+                should_cruise = True
+                controller.steering_threshold = STEERING_THRESHOLD_MAP
         else:
             # 无紫线 (到达目的地 或 丢失)
             if endless_mode and has_lane_signal:
@@ -215,7 +236,11 @@ def main():
             # --- 转向控制 ---
             # 只有在巡航状态下才进行转向修正，刹车时保持直行以防乱转
             if should_cruise:
-                action_steer = controller.get_action(final_offset)
+                # 动态调整最大转向时长 (针对十字路口急转弯)
+                # 如果偏移量巨大 (>200)，说明是急弯，允许更长的按键时间 (0.6s)
+                # 否则使用默认的微调时间 (0.15s)
+                max_turn_duration = 0.6 if abs(final_offset) > 200 else 0.15
+                action_steer = controller.get_action(final_offset, max_duration=max_turn_duration)
             else:
                 action_steer = 'Straight'
             
@@ -227,6 +252,8 @@ def main():
                 target_key = 'SPACE'
                 action_speed = 'BRAKE (Danger)'
             elif should_cruise:
+                # 始终保持动力 (按住 W)，即使是急转弯
+                # 之前的逻辑会在急转弯时按 S 导致停车，现已移除
                 target_key = 'W'
                 action_speed = 'CRUISE'
             else:

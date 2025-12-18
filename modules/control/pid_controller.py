@@ -23,12 +23,12 @@ class PIDController:
         turn_thread = threading.Thread(target=turn_action)
         turn_thread.start()
 
-    def update(self, offset):
+    def update(self, offset, max_duration=0.15):
         """
         根据偏移量更新转向控制 (点按模式)
-        :param offset: 车辆与车道中心的偏移量 (像素)
-                       - 负数: 车在车道线左边 (需要向右转 -> D)
-                       - 正数: 车在车道线右边 (需要向左转 -> A)
+        :param offset: 车辆与车道中心的偏移量
+        :param max_duration: 最大按键时长 (秒)，默认为 0.15s (微调模式)。
+                             如果是急转弯，可以传入更大的值 (如 0.5s)。
         """
         current_time = time.time()
 
@@ -43,10 +43,11 @@ class PIDController:
             return # 偏移量很小，无需转向
 
         # 3. 计算点按时长和方向
-        # 点按时长与误差成正比，但设置一个上限和下限，防止过长或过短
+        # 点按时长与误差成正比
         press_duration = abs(error) * self.Kp
-        # 调整最大按键时长，配合冷却时间。单次最长按 0.15s
-        press_duration = max(0.02, min(press_duration, 0.15)) 
+        
+        # 动态限制: 最小 0.02s，最大由参数决定
+        press_duration = max(0.02, min(press_duration, max_duration)) 
 
         # 修正转向逻辑：
         # offset > 0 表示目标在右边 (车偏左)，需要向右转 (D)
@@ -58,11 +59,11 @@ class PIDController:
         
         return f"Turn {target_key} ({press_duration:.2f}s)"
 
-    def get_action(self, offset):
+    def get_action(self, offset, max_duration=0.15):
         """
         兼容旧接口的别名
         """
-        result = self.update(offset)
+        result = self.update(offset, max_duration)
         return result if result else "Straight"
 
         # 4. 执行转向并更新时间戳
