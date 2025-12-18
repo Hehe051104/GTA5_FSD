@@ -43,12 +43,14 @@ KEY_W = 0x11
 KEY_A = 0x1E
 KEY_S = 0x1F
 KEY_D = 0x20
+KEY_SPACE = 0x39
 
 KEY_MAP = {
     'W': KEY_W,
     'A': KEY_A,
     'S': KEY_S,
     'D': KEY_D,
+    'SPACE': KEY_SPACE,
 }
 
 # Actual functions to press and release keys
