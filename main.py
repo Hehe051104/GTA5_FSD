@@ -3,9 +3,11 @@
 import cv2
 import time
 import numpy as np
+import win32api # For global key state
 from utils.screen_grab import ScreenGrabber
 from modules.perception.yolop_service import YOLOPService # New SOTA YOLOPv2
 from modules.perception.yolo_service import YoloService   # YOLOv8 Object Detection
+from modules.perception.map_reader import MapReader       # Minimap Navigation
 from modules.control.pid_controller import PIDController
 from utils.directkeys import press_key_by_name, release_key_by_name
 
@@ -28,7 +30,7 @@ ROI_CONFIG = {
 }
 # ===========================================
 
-def check_danger(detections, lane_center_x):
+def check_danger(detections, lane_center_x, brake_line_y=None):
     """
     检查是否有物体进入基于车道中心的动态危险区域，并判断距离
     """
@@ -41,7 +43,9 @@ def check_danger(detections, lane_center_x):
     roi_x_max = min(VIEW_WIDTH, roi_x_max)
 
     # 计算刹车线的 Y 坐标 (像素)
-    brake_line_y = int(VIEW_HEIGHT * ROI_CONFIG['brake_threshold'])
+    # 如果传入了动态刹车线 (基于 offset_y)，则使用它；否则使用默认阈值
+    if brake_line_y is None:
+        brake_line_y = int(VIEW_HEIGHT * ROI_CONFIG['brake_threshold'])
 
     current_roi = {
         'x_min': int(roi_x_min),
@@ -94,6 +98,9 @@ def main():
         # 初始化 YOLOv8 服务 (物体检测：车辆、行人等)
         yolo_bot = YoloService(model_path='models/yolov8n.pt')
         
+        # 初始化小地图导航
+        map_bot = MapReader()
+        
         # 控制器
         controller = PIDController(Kp=KP, steering_threshold=STEERING_THRESHOLD, turn_cooldown=TURN_COOLDOWN)
             
@@ -110,6 +117,7 @@ def main():
     
     # 自动驾驶开关状态 (本地变量)
     autopilot_on = ENABLE_AUTOPILOT
+    l_key_pressed = False # 用于 L 键防抖
 
     while True:
         t0 = time.time()
@@ -131,12 +139,19 @@ def main():
         # 所以 lane_center = screen_center + offset
         current_lane_center_x = (VIEW_WIDTH // 2) + lane_info['offset']
         
+        # --- 小地图导航处理 ---
+        # 注意：map_bot 需要原始分辨率的帧来截取小地图区域
+        nav_offset, minimap_vis = map_bot.process(raw_frame)
+        
         # 3. YOLOv8 物体检测
         # 在 YOLOPv2 的结果上叠加检测框
         detections = yolo_bot.detect(frame)
         
         # --- 碰撞风险检测 (使用动态 ROI) ---
-        is_danger, danger_obj, current_roi = check_danger(detections, current_lane_center_x)
+        # 使用 lane_info 中的 offset_y 作为刹车线高度
+        # 如果 offset_y 存在，则刹车线与车道中心点高度一致
+        dynamic_brake_y = lane_info.get('offset_y', None)
+        is_danger, danger_obj, current_roi = check_danger(detections, current_lane_center_x, brake_line_y=dynamic_brake_y)
         
         # 可视化危险区域 (动态跟随车道)
         roi_color = (0, 0, 255) if is_danger else (0, 255, 0) # 红/绿
@@ -176,11 +191,39 @@ def main():
         # 4. 控制逻辑
         action_steer = 'Straight'
         action_speed = 'Idle'
+        
+        # 决策逻辑：
+        # 1. 视觉车道保持 (最高优先级，精度最高)
+        # 2. 小地图道路保持 (中等优先级，用于视觉丢失时)
+        # 3. 小地图导航 (用于路口转向或辅助)
+        
+        final_offset = 0
+        nav_source = "None"
+        
+        # 检查小地图是否有有效信号 (导航或道路)
+        has_map_signal = (nav_offset is not None and nav_offset != 0)
+        
+        if 'Tracking' in status:
+            # 视觉系统正常工作
+            final_offset = offset
+            nav_source = "Vision (Lane)"
+            
+            # 如果小地图指示大幅度转向 (例如路口)，可以尝试融合
+            # 但目前为了稳定性，视觉优先
+        elif has_map_signal:
+            # 视觉丢失，使用小地图 (导航优先，道路其次，由 MapReader 内部处理)
+            final_offset = nav_offset
+            nav_source = "Map (GPS/Road)"
+        else:
+            nav_source = "Lost"
 
         if autopilot_on:
             # --- 转向控制 ---
-            if 'Tracking' in status:
-                action_steer = controller.get_action(offset)
+            if nav_source != "Lost":
+                action_steer = controller.get_action(final_offset)
+            else:
+                # 丢失所有信号，保持直行
+                action_steer = 'Straight'
             
             # --- 速度控制 (ACC) ---
             target_key = 'W' # 默认巡航
@@ -208,28 +251,52 @@ def main():
         # 5. 显示信息
         fps = 1 / (time.time() - t0)
         
+        # 叠加小地图可视化
+        if minimap_vis is not None:
+            try:
+                # 将小地图可视化缩放并放置在右上角
+                h, w = minimap_vis.shape[:2]
+                target_h = 150
+                scale = target_h / h
+                target_w = int(w * scale)
+                minimap_small = cv2.resize(minimap_vis, (target_w, target_h))
+                
+                # 放置在右上角
+                result_frame[10:10+target_h, VIEW_WIDTH-10-target_w:VIEW_WIDTH-10] = minimap_small
+                cv2.putText(result_frame, "GPS Nav", (VIEW_WIDTH-10-target_w, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+            except Exception as e:
+                print(f"Minimap overlay error: {e}")
+
         cv2.putText(result_frame, f'FPS: {fps:.1f}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-        cv2.putText(result_frame, f'Offset: {offset}', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+        cv2.putText(result_frame, f'Offset: {final_offset:.2f}', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
         cv2.putText(result_frame, f'Steer: {action_steer}', (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         cv2.putText(result_frame, f'Speed: {action_speed}', (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         cv2.putText(result_frame, f'Status: {status}', (10, 190), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 2)
+        cv2.putText(result_frame, f'Nav: {nav_source}', (10, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
         
         if autopilot_on:
-             cv2.putText(result_frame, 'MODE: AUTOPILOT (ACC + LKA)', (10, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-             cv2.putText(result_frame, '[L] to Disable', (10, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+             cv2.putText(result_frame, 'MODE: AUTOPILOT (ACC + LKA)', (10, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+             cv2.putText(result_frame, '[L] to Disable', (10, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         else:
-             cv2.putText(result_frame, 'MODE: MANUAL', (10, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-             cv2.putText(result_frame, '[L] to Enable', (10, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+             cv2.putText(result_frame, 'MODE: MANUAL', (10, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+             cv2.putText(result_frame, '[L] to Enable', (10, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
         # 显示主窗口
         cv2.imshow('GTA5 FSD - Turbo', result_frame)
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
+        # --- 全局按键检测 (win32api) ---
+        # 检测 'L' 键 (0x4C)
+        if win32api.GetAsyncKeyState(0x4C):
+            if not l_key_pressed:
+                autopilot_on = not autopilot_on
+                print(f"Autopilot toggled: {autopilot_on}")
+                l_key_pressed = True
+        else:
+            l_key_pressed = False
+
+        # OpenCV 窗口按键 (仅用于退出)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
-        elif key == ord('l'):
-            autopilot_on = not autopilot_on
-            print(f"Autopilot toggled: {autopilot_on}")
 
     cv2.destroyAllWindows()
 

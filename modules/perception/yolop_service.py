@@ -266,6 +266,7 @@ class YOLOPService:
                 status = "Lost"
 
         # 绘制最终偏移量（以当前用于计算的 scan_y 为准）
+        vis_y = scan_y
         if status != "Lost":
             vis_y = cy if cy is not None else scan_y
             cv2.line(img, (screen_center, vis_y), (screen_center + int(offset), vis_y), (0, 255, 255), 2)
@@ -279,4 +280,4 @@ class YOLOPService:
         # 叠加到原图
         result_img = cv2.addWeighted(img, 1, color_mask, 0.5, 0)
         
-        return result_img, {'offset': offset, 'status': status}
+        return result_img, {'offset': offset, 'status': status, 'offset_y': vis_y}
