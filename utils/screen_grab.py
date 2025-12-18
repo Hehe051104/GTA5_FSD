@@ -15,23 +15,22 @@ class ScreenGrabber:
     def __init__(self):
         # 初始化截屏对象
         self.sct = mss.mss()
-        # 这里不再计算坐标，因为坐标随时会变
+        self.hwnd = None # 缓存窗口句柄
 
     def get_frame(self):
         """
-        每一帧都重新询问 Windows：GTA5 窗口现在在哪？
+        获取屏幕帧，经过优化，缓存句柄
         """
         try:
-            # 1. 实时查找窗口句柄
-            hwnd = win32gui.FindWindow(None, GTA_WINDOW_TITLE)
+            # 1. 如果没有缓存句柄，或者句柄失效，则重新查找
+            if self.hwnd is None or not win32gui.IsWindow(self.hwnd):
+                self.hwnd = win32gui.FindWindow(None, GTA_WINDOW_TITLE)
+                if not self.hwnd:
+                    return None
 
-            # 如果没找到（比如游戏没开），返回 None
-            if not hwnd:
-                return None
-
-            # 2. [核心逻辑] 实时获取窗口的最新坐标
+            # 2. [核心逻辑] 实时获取窗口的最新坐标 (GetWindowRect 非常快)
             # rect 返回的是 (left, top, right, bottom)
-            rect = win32gui.GetWindowRect(hwnd)
+            rect = win32gui.GetWindowRect(self.hwnd)
             x, y, r, b = rect
 
             # 计算宽度和高度

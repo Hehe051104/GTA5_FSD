@@ -23,7 +23,7 @@ def main():
         print(f'将在 {i+1} 秒后启动...')
         time.sleep(1)
 
-    print(f' GTA5_FSD (YOLOPv2 Mode) 启动...')
+    print(f' GTA5_FSD (Turbo Mode) 启动...')
 
     try:
         grabber = ScreenGrabber()
@@ -41,19 +41,23 @@ def main():
         traceback.print_exc()
         return
 
-    print(' 视觉系统就绪')
-    last_time = time.time()
-
+    print(' 视觉系统就绪 - 自动驾驶已启用')
+    
     while True:
+        t0 = time.time()
+        
         # 1. 获取屏幕
         raw_frame = grabber.get_frame()
         if raw_frame is None: continue
+        t1 = time.time()
 
         frame = cv2.resize(raw_frame, (VIEW_WIDTH, VIEW_HEIGHT))
+        t2 = time.time()
         
         # 2. YOLOPv2 全能处理
         # process 返回: 叠加了分割图的帧, 导航信息
         result_frame, lane_info = yolop_bot.process(frame)
+        t3 = time.time()
         
         offset = lane_info['offset']
         status = lane_info['status']
@@ -65,10 +69,9 @@ def main():
             action = controller.get_action(offset)
         else:
             action = 'Manual Mode' if not ENABLE_AUTOPILOT else 'Straight'
-
+        
         # 4. 显示信息
-        fps = 1 / (time.time() - last_time)
-        last_time = time.time()
+        fps = 1 / (time.time() - t0)
         
         cv2.putText(result_frame, f'FPS: {fps:.1f}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
         cv2.putText(result_frame, f'Offset: {offset}', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
@@ -81,7 +84,7 @@ def main():
              cv2.putText(result_frame, 'MODE: MANUAL', (10, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
         # 显示主窗口
-        cv2.imshow('GTA5 FSD - YOLOPv2', result_frame)
+        cv2.imshow('GTA5 FSD - Turbo', result_frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break

@@ -4,6 +4,7 @@ import onnxruntime as ort
 import os
 import urllib.request
 import torch
+import time
 
 class YOLOPService:
     def __init__(self, model_path='models/yolopv2.onnx', device='cuda'):
@@ -21,6 +22,11 @@ class YOLOPService:
         # 如果使用 PyTorch
         if self.use_torch:
             print(f"ℹ️ 检测到 .pt 文件，将使用 PyTorch (TorchScript) 模式。")
+            print(f"🔍 PyTorch Version: {torch.__version__}")
+            print(f"🔍 CUDA Available: {torch.cuda.is_available()}")
+            if torch.cuda.is_available():
+                print(f"🔍 CUDA Device: {torch.cuda.get_device_name(0)}")
+            
             if not os.path.exists(model_path):
                  print(f"❌ 错误: 指定的 TorchScript 模型文件不存在: {model_path}")
                  raise FileNotFoundError(f"Model file not found: {model_path}")
@@ -28,11 +34,39 @@ class YOLOPService:
                 self.model = torch.jit.load(model_path)
                 if device == 'cuda' and torch.cuda.is_available():
                     self.model = self.model.cuda()
-                    print("🧠 YOLOPv2 Service (TorchScript) ... Device: CUDA")
+                    
+                    # --- 性能优化核心 ---
+                    # 1. 启用 cuDNN Benchmark (针对固定输入尺寸优化卷积算法)
+                    torch.backends.cudnn.benchmark = True
+                    
+                    # 2. 尝试启用 FP16 (半精度)
+                    try:
+                        self.model = self.model.half()
+                        self.use_half = True
+                        print("🧠 YOLOPv2 Service (TorchScript) ... Device: CUDA (FP16 Turbo Mode ⚡) ✅")
+                    except Exception as e:
+                        self.use_half = False
+                        print(f"⚠️ FP16 转换失败，回退到 FP32: {e}")
+                        print("🧠 YOLOPv2 Service (TorchScript) ... Device: CUDA (FP32)")
                 else:
                     self.model = self.model.cpu()
+                    self.use_half = False
                     print("🧠 YOLOPv2 Service (TorchScript) ... Device: CPU")
+                
                 self.model.eval()
+                
+                # Warmup (需要根据精度调整输入类型)
+                print("🔥 Running warmup inference...")
+                dummy_input = torch.randn(1, 3, 640, 640)
+                if device == 'cuda' and torch.cuda.is_available():
+                    dummy_input = dummy_input.cuda()
+                    if self.use_half:
+                        dummy_input = dummy_input.half()
+                
+                with torch.no_grad():
+                    self.model(dummy_input)
+                print("✅ Warmup complete.")
+                
                 return # PyTorch 初始化完成
             except Exception as e:
                 print(f"❌ 加载 TorchScript 模型失败: {e}")
@@ -103,6 +137,9 @@ class YOLOPService:
                 tensor = torch.from_numpy(input_tensor)
                 if self.device == 'cuda' and torch.cuda.is_available():
                     tensor = tensor.cuda()
+                    # 如果启用了 FP16，需要将输入也转换为 half
+                    if getattr(self, 'use_half', False):
+                        tensor = tensor.half()
                 
                 # YOLOPv2 TorchScript 输出通常也是 tuple
                 outputs = self.model(tensor)
@@ -120,10 +157,21 @@ class YOLOPService:
                     print(f"⚠️ 模型输出类型异常: {type(outputs)}")
                     return None, None, None
 
-                # 确保转回 CPU numpy
-                if isinstance(det_out, torch.Tensor): det_out = det_out.detach().cpu().numpy()
-                if isinstance(da_seg_out, torch.Tensor): da_seg_out = da_seg_out.detach().cpu().numpy()
-                if isinstance(ll_seg_out, torch.Tensor): ll_seg_out = ll_seg_out.detach().cpu().numpy()
+                # 确保转回 CPU numpy 并转换为 float32 (OpenCV 不支持 float16)
+                if isinstance(det_out, torch.Tensor): 
+                    det_out = det_out.detach().cpu().numpy()
+                if isinstance(det_out, np.ndarray) and det_out.dtype == np.float16:
+                    det_out = det_out.astype(np.float32)
+
+                if isinstance(da_seg_out, torch.Tensor): 
+                    da_seg_out = da_seg_out.detach().cpu().numpy()
+                if isinstance(da_seg_out, np.ndarray) and da_seg_out.dtype == np.float16:
+                    da_seg_out = da_seg_out.astype(np.float32)
+
+                if isinstance(ll_seg_out, torch.Tensor): 
+                    ll_seg_out = ll_seg_out.detach().cpu().numpy()
+                if isinstance(ll_seg_out, np.ndarray) and ll_seg_out.dtype == np.float16:
+                    ll_seg_out = ll_seg_out.astype(np.float32)
                 
                 return det_out, da_seg_out, ll_seg_out
         else:
@@ -146,8 +194,6 @@ class YOLOPService:
         
         # --- 后处理分割掩码 ---
         # da_seg shape: (1, 2, 640, 640) -> 取 channel 1 (前景)
-        # ll_seg shape: (1, 2, 640, 640) -> 取 channel 1 (前景)
-        # 注意：某些模型导出可能只有 1 个 channel (1, 1, 640, 640)
         
         def get_mask(seg_out):
             if seg_out.shape[1] == 2:
@@ -156,7 +202,7 @@ class YOLOPService:
                 return seg_out[0][0] # 只有一个通道，直接取
 
         da_mask = get_mask(da_seg)
-        ll_mask = get_mask(ll_seg)
+        ll_mask = get_mask(ll_seg) 
         
         # 二值化
         # da_mask (可行驶区域) 保持 0.5
@@ -223,8 +269,6 @@ class YOLOPService:
         if status != "Lost":
             vis_y = cy if cy is not None else scan_y
             cv2.line(img, (screen_center, vis_y), (screen_center + int(offset), vis_y), (0, 255, 255), 2)
-
-        # --- 可视化 ---
 
         # --- 可视化 ---
         # 创建彩色遮罩
