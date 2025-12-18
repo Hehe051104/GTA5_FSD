@@ -49,11 +49,6 @@ MINIMAP_ROI_RATIO = [0.815, 1.045, 0.001, 0.171]
 NAV_COLOR_LOWER = np.array([125, 50, 100])
 NAV_COLOR_UPPER = np.array([155, 255, 255])
 
-# Road (White/Grey) HSV Thresholds
-# Roads are usually desaturated (low S) and bright (high V)
-ROAD_COLOR_LOWER = np.array([0, 0, 180])
-ROAD_COLOR_UPPER = np.array([180, 50, 255])
-
 # Fusion Weights: 70% Map (Direction), 30% Lane (Centering)
 W_MAP = 0.7
 W_LANE = 0.3

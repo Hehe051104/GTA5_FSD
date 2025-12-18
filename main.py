@@ -15,11 +15,18 @@ from utils.directkeys import press_key_by_name, release_key_by_name
 # ================= 配置区域 =================
 VIEW_WIDTH = 1280
 VIEW_HEIGHT = 720
-STEERING_THRESHOLD = 140  # 再次增大阈值：只有偏移超过 150 像素才转向
+
+# --- 转向阈值配置 ---
+# 视觉车道保持阈值: 降低到 60 以提供更灵敏的修正，防止大幅度画龙
+STEERING_THRESHOLD_LANE = 120
+# 小地图导航阈值: 保持灵敏
+STEERING_THRESHOLD_MAP = 20    
+
 # --- PID 控制器参数 ---
-KP = 0.005  # 增加 KP：单次修正力度加大
-TURN_COOLDOWN = 0.25 # 增加冷却：每次转向后强制等待 0.25s，防止连续微调导致画龙
-ENABLE_AUTOPILOT = True # 开关：启用自动驾驶控制 (LKA模式)
+KP = 0.005  
+# 冷却时间: 降低到 0.2s，允许更频繁的微调
+TURN_COOLDOWN = 0.2 
+ENABLE_AUTOPILOT = True 
 
 # --- 危险区域配置 (ROI) ---
 # 动态 ROI 配置
@@ -55,8 +62,8 @@ def main():
         # 初始化碰撞预警系统
         collision_monitor = CollisionMonitor(expansion_threshold=1.05, history_len=5)
         
-        # 控制器
-        controller = PIDController(Kp=KP, steering_threshold=STEERING_THRESHOLD, turn_cooldown=TURN_COOLDOWN)
+        # 控制器 (默认使用车道保持阈值)
+        controller = PIDController(Kp=KP, steering_threshold=STEERING_THRESHOLD_LANE, turn_cooldown=TURN_COOLDOWN)
             
     except Exception as e:
         print(f' 初始化失败: {e}')
@@ -72,6 +79,10 @@ def main():
     # 自动驾驶开关状态 (本地变量)
     autopilot_on = ENABLE_AUTOPILOT
     l_key_pressed = False # 用于 L 键防抖
+    
+    # 无尽模式状态 (K键控制)
+    endless_mode = False
+    k_key_pressed = False
 
     while True:
         t0 = time.time()
@@ -162,47 +173,66 @@ def main():
         action_steer = 'Straight'
         action_speed = 'Idle'
         
-        # 决策逻辑：
-        # 1. 视觉车道保持 (最高优先级，精度最高)
-        # 2. 小地图道路保持 (中等优先级，用于视觉丢失时)
-        # 3. 小地图导航 (用于路口转向或辅助)
-        
         final_offset = 0
         nav_source = "None"
         
-        # 检查小地图是否有有效信号 (导航或道路)
-        has_map_signal = (nav_offset is not None and nav_offset != 0)
+        # 检查信号状态
+        has_map_signal = (nav_offset is not None)
+        has_lane_signal = ('Tracking' in status)
         
-        if 'Tracking' in status:
-            # 视觉系统正常工作
-            final_offset = offset
-            nav_source = "Vision (Lane)"
-            
-            # 如果小地图指示大幅度转向 (例如路口)，可以尝试融合
-            # 但目前为了稳定性，视觉优先
-        elif has_map_signal:
-            # 视觉丢失，使用小地图 (导航优先，道路其次，由 MapReader 内部处理)
-            final_offset = nav_offset
-            nav_source = "Map (GPS/Road)"
+        # --- 决策状态机 ---
+        should_cruise = False
+        
+        if has_map_signal:
+            if has_lane_signal:
+                # 场景1: 正常导航 (有紫线 + 有车道) -> 融合模式
+                # 逻辑：以视觉车道保持为主(70%)，小地图导航为辅(30%)
+                # 这样既能保持视觉的平滑性，又能让小地图在路口提供转向指引
+                final_offset = (offset * 0.7) + (nav_offset * 0.3)
+                nav_source = "Fusion (Lane+Map)"
+                should_cruise = True
+                # 使用中等灵敏度 (介于 20 和 140 之间)，防止过度敏感
+                controller.steering_threshold = 40 
+            else:
+                # 场景2: 偏移道路 (有紫线 + 无车道) -> 刹车
+                nav_source = "Map Only (No Lane)"
+                should_cruise = False # Brake
         else:
-            nav_source = "Lost"
+            # 无紫线 (到达目的地 或 丢失)
+            if endless_mode and has_lane_signal:
+                # 场景3: 无尽模式 (无紫线 + 有车道 + K键激活)
+                final_offset = offset
+                nav_source = "Vision (Endless)"
+                should_cruise = True
+                # 切换回低灵敏度阈值 (防画龙)
+                controller.steering_threshold = STEERING_THRESHOLD_LANE
+            else:
+                # 场景4: 到达目的地/完全丢失 -> 刹车
+                nav_source = "Dest/Lost"
+                should_cruise = False # Brake
 
         if autopilot_on:
             # --- 转向控制 ---
-            if nav_source != "Lost":
+            # 只有在巡航状态下才进行转向修正，刹车时保持直行以防乱转
+            if should_cruise:
                 action_steer = controller.get_action(final_offset)
             else:
-                # 丢失所有信号，保持直行
                 action_steer = 'Straight'
             
             # --- 速度控制 (ACC) ---
-            target_key = 'W' # 默认巡航
+            target_key = 'W' # 默认
             
             if is_danger:
-                target_key = 'SPACE' # 危险则刹车 (使用空格键)
+                # 碰撞预警优先级最高
+                target_key = 'SPACE'
                 action_speed = 'BRAKE (Danger)'
-            else:
+            elif should_cruise:
+                target_key = 'W'
                 action_speed = 'CRUISE'
+            else:
+                # 导航逻辑要求的停车
+                target_key = 'SPACE'
+                action_speed = 'BRAKE (Nav Logic)'
             
             # 执行按键切换
             if target_key != current_speed_key:
@@ -250,6 +280,10 @@ def main():
         else:
              cv2.putText(result_frame, 'MODE: MANUAL', (10, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
              cv2.putText(result_frame, '[L] to Enable', (10, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        
+        # 显示无尽模式状态
+        endless_color = (0, 255, 0) if endless_mode else (100, 100, 100)
+        cv2.putText(result_frame, f'Endless Mode [K]: {"ON" if endless_mode else "OFF"}', (10, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.6, endless_color, 2)
 
         # 显示主窗口
         cv2.imshow('GTA5 FSD - Turbo', result_frame)
@@ -263,6 +297,15 @@ def main():
                 l_key_pressed = True
         else:
             l_key_pressed = False
+            
+        # 检测 'K' 键 (0x4B) - 无尽模式切换
+        if win32api.GetAsyncKeyState(0x4B):
+            if not k_key_pressed:
+                endless_mode = not endless_mode
+                print(f"Endless Mode toggled: {endless_mode}")
+                k_key_pressed = True
+        else:
+            k_key_pressed = False
 
         # OpenCV 窗口按键 (仅用于退出)
         if cv2.waitKey(1) & 0xFF == ord('q'):

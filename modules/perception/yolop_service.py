@@ -36,18 +36,18 @@ class YOLOPService:
                     self.model = self.model.cuda()
                     
                     # --- 性能优化核心 ---
-                    # 1. 启用 cuDNN Benchmark (针对固定输入尺寸优化卷积算法)
-                    torch.backends.cudnn.benchmark = True
+                    # 1. 禁用 cuDNN Benchmark 以提高稳定性 (防止 0xC0000409 崩溃)
+                    torch.backends.cudnn.benchmark = False
                     
-                    # 2. 尝试启用 FP16 (半精度)
-                    try:
-                        self.model = self.model.half()
-                        self.use_half = True
-                        print("🧠 YOLOPv2 Service (TorchScript) ... Device: CUDA (FP16 Turbo Mode ⚡) ✅")
-                    except Exception as e:
-                        self.use_half = False
-                        print(f"⚠️ FP16 转换失败，回退到 FP32: {e}")
-                        print("🧠 YOLOPv2 Service (TorchScript) ... Device: CUDA (FP32)")
+                    # 2. 暂时禁用 FP16 (半精度) 以排查崩溃问题
+                    # try:
+                    #     self.model = self.model.half()
+                    #     self.use_half = True
+                    #     print("🧠 YOLOPv2 Service (TorchScript) ... Device: CUDA (FP16 Turbo Mode ⚡) ✅")
+                    # except Exception as e:
+                    self.use_half = False
+                    #     print(f"⚠️ FP16 转换失败，回退到 FP32: {e}")
+                    print("🧠 YOLOPv2 Service (TorchScript) ... Device: CUDA (FP32 Safe Mode)")
                 else:
                     self.model = self.model.cpu()
                     self.use_half = False

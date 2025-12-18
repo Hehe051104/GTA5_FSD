@@ -2,7 +2,7 @@
 
 import cv2
 import numpy as np
-from config import MINIMAP_ROI_RATIO, NAV_COLOR_LOWER, NAV_COLOR_UPPER, ROAD_COLOR_LOWER, ROAD_COLOR_UPPER
+from config import MINIMAP_ROI_RATIO, NAV_COLOR_LOWER, NAV_COLOR_UPPER
 
 class MapReader:
     def __init__(self):
@@ -22,31 +22,33 @@ class MapReader:
         map_h, map_w = minimap.shape[:2]
 
         car_center_x = map_w // 2
-        car_center_y = map_h // 2
+        # Adjust car center Y to align with the player arrow (slightly lower than image center)
+        car_center_y = int(map_h * 0.58)
 
         hsv = cv2.cvtColor(minimap, cv2.COLOR_BGR2HSV)
         
         # 1. Detect Navigation Route (Purple)
         mask_nav = cv2.inRange(hsv, NAV_COLOR_LOWER, NAV_COLOR_UPPER)
         
-        # 2. Detect Road (White/Grey)
-        mask_road = cv2.inRange(hsv, ROAD_COLOR_LOWER, ROAD_COLOR_UPPER)
-
+        # --- Optimization: Limit Lookahead (Circular ROI) ---
+        # Only consider the path within a certain radius of the car to avoid distant turns affecting steering
+        # Radius set to 25% of the smaller dimension (Reduced from 35% to focus on immediate path)
+        lookahead_radius = int(min(map_h, map_w) * 0.25) 
+        mask_roi = np.zeros_like(mask_nav)
+        cv2.circle(mask_roi, (car_center_x, car_center_y), lookahead_radius, 255, -1)
+        mask_nav = cv2.bitwise_and(mask_nav, mask_roi)
+        
         kernel = np.ones((3,3), np.uint8)
         mask_nav = cv2.erode(mask_nav, kernel, iterations=1)
         mask_nav = cv2.dilate(mask_nav, kernel, iterations=2)
         
-        mask_road = cv2.erode(mask_road, kernel, iterations=1)
-        mask_road = cv2.dilate(mask_road, kernel, iterations=2)
-
-        # --- Logic: Prioritize Navigation, Fallback to Road ---
-        nav_error = 0
+        # --- Logic: Only Navigation ---
+        nav_error = None
         target_x = car_center_x
         target_y = car_center_y
         
-        # Check for Navigation Route first
+        # Check for Navigation Route
         nonzero_nav = cv2.findNonZero(mask_nav)
-        nonzero_road = cv2.findNonZero(mask_road)
         
         active_mask_points = None
         mode = "None"
@@ -56,15 +58,11 @@ class MapReader:
             mode = "Nav (Purple)"
             # Visualization: Highlight Nav
             minimap[mask_nav > 0] = [0, 255, 0] # Green overlay for Nav
-        elif nonzero_road is not None:
-            active_mask_points = nonzero_road
-            mode = "Road (White)"
-            # Visualization: Highlight Road
-            minimap[mask_road > 0] = [0, 100, 255] # Orange overlay for Road
 
         # Visual Debug Elements
-        cv2.line(minimap, (car_center_x, 0), (car_center_x, map_h), (255, 0, 0), 2) # Vertical Center
-        cv2.line(minimap, (0, car_center_y), (map_w, car_center_y), (255, 0, 0), 2) # Horizontal Center
+        cv2.line(minimap, (car_center_x, 0), (car_center_x, map_h), (255, 0, 0), 1) # Vertical Center
+        cv2.line(minimap, (0, car_center_y), (map_w, car_center_y), (255, 0, 0), 1) # Horizontal Center
+        cv2.circle(minimap, (car_center_x, car_center_y), lookahead_radius, (200, 200, 200), 1) # Lookahead Limit Circle
 
         if active_mask_points is not None:
             # Calculate centroid of the path
