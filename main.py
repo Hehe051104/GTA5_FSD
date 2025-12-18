@@ -5,6 +5,7 @@ import time
 import numpy as np
 from utils.screen_grab import ScreenGrabber
 from modules.perception.yolop_service import YOLOPService # New SOTA YOLOPv2
+from modules.perception.yolo_service import YoloService   # YOLOv8 Object Detection
 from modules.control.pid_controller import PIDController
 
 # ================= 配置区域 =================
@@ -32,6 +33,9 @@ def main():
         # 首次运行会自动下载模型 (约 180MB)
         yolop_bot = YOLOPService(model_path='models/yolopv2.pt', device='cuda')
         
+        # 初始化 YOLOv8 服务 (物体检测：车辆、行人等)
+        yolo_bot = YoloService(model_path='models/yolov8n.pt')
+        
         # 控制器
         controller = PIDController(Kp=KP, steering_threshold=STEERING_THRESHOLD, turn_cooldown=TURN_COOLDOWN)
             
@@ -57,12 +61,29 @@ def main():
         # 2. YOLOPv2 全能处理
         # process 返回: 叠加了分割图的帧, 导航信息
         result_frame, lane_info = yolop_bot.process(frame)
+        
+        # 3. YOLOv8 物体检测
+        # 在 YOLOPv2 的结果上叠加检测框
+        detections = yolo_bot.detect(frame)
+        for det in detections:
+            x1, y1, x2, y2 = det['bbox']
+            label = f"{det['label']} {det['conf']:.2f}"
+            color = (0, 165, 255) # 橙色框
+            
+            # 画框
+            cv2.rectangle(result_frame, (x1, y1), (x2, y2), color, 2)
+            # 画标签背景
+            (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(result_frame, (x1, y1 - 20), (x1 + w, y1), color, -1)
+            # 画文字
+            cv2.putText(result_frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
         t3 = time.time()
         
         offset = lane_info['offset']
         status = lane_info['status']
 
-        # 3. 控制逻辑
+        # 4. 控制逻辑
         action = 'Straight'
         # 只要状态包含 'Tracking' (无论是 AreaPrimary 还是 Lines)，都启用控制
         if ENABLE_AUTOPILOT and 'Tracking' in status:
