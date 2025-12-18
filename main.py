@@ -8,13 +8,14 @@ from utils.screen_grab import ScreenGrabber
 from modules.perception.yolop_service import YOLOPService # New SOTA YOLOPv2
 from modules.perception.yolo_service import YoloService   # YOLOv8 Object Detection
 from modules.perception.map_reader import MapReader       # Minimap Navigation
+from modules.perception.collision_monitor import CollisionMonitor # Collision Warning
 from modules.control.pid_controller import PIDController
 from utils.directkeys import press_key_by_name, release_key_by_name
 
 # ================= 配置区域 =================
 VIEW_WIDTH = 1280
 VIEW_HEIGHT = 720
-STEERING_THRESHOLD = 150  # 再次增大阈值：只有偏移超过 150 像素才转向
+STEERING_THRESHOLD = 140  # 再次增大阈值：只有偏移超过 150 像素才转向
 # --- PID 控制器参数 ---
 KP = 0.005  # 增加 KP：单次修正力度加大
 TURN_COOLDOWN = 0.25 # 增加冷却：每次转向后强制等待 0.25s，防止连续微调导致画龙
@@ -29,56 +30,6 @@ ROI_CONFIG = {
     'brake_threshold': 0.55         # 刹车距离阈值 (0.0-1.0): 物体底部超过屏幕高度的 55% 时刹车
 }
 # ===========================================
-
-def check_danger(detections, lane_center_x, brake_line_y=None):
-    """
-    检查是否有物体进入基于车道中心的动态危险区域，并判断距离
-    """
-    # 动态计算 ROI X 范围
-    roi_x_min = lane_center_x - (ROI_CONFIG['lane_width'] // 2)
-    roi_x_max = lane_center_x + (ROI_CONFIG['lane_width'] // 2)
-    
-    # 边界检查
-    roi_x_min = max(0, roi_x_min)
-    roi_x_max = min(VIEW_WIDTH, roi_x_max)
-
-    # 计算刹车线的 Y 坐标 (像素)
-    # 如果传入了动态刹车线 (基于 offset_y)，则使用它；否则使用默认阈值
-    if brake_line_y is None:
-        brake_line_y = int(VIEW_HEIGHT * ROI_CONFIG['brake_threshold'])
-
-    current_roi = {
-        'x_min': int(roi_x_min),
-        'x_max': int(roi_x_max),
-        'y_min': ROI_CONFIG['y_min'],
-        'y_max': ROI_CONFIG['y_max'],
-        'brake_line': brake_line_y
-    }
-
-    for det in detections:
-        # 只关心车辆、行人等障碍物
-        if det['label'] in ['car', 'truck', 'bus', 'motorcycle', 'person']:
-            x1, y1, x2, y2 = det['bbox']
-            # 计算物体底部中心点
-            cx = (x1 + x2) // 2
-            cy = y2 
-            
-            # 1. X轴判断: 物体中心是否在本车道内
-            in_lane = (current_roi['x_min'] < cx < current_roi['x_max'])
-            
-            # 2. Y轴判断: 物体是否在地平线以下 (有效视野内)
-            in_view = (current_roi['y_min'] < cy < current_roi['y_max'])
-            
-            if in_lane and in_view:
-                # 3. 距离判断: 只有当物体底部超过刹车线 (离我们足够近) 时才刹车
-                # y 坐标越大，代表物体在屏幕越下方，离我们越近
-                if cy > brake_line_y:
-                    return True, det, current_roi # [危险] 距离过近，刹车！
-                else:
-                    # 在车道内但距离尚远，可以返回一个 "预警" 状态 (这里暂不处理，视为安全)
-                    pass
-                
-    return False, None, current_roi
 
 def main():
     # 倒计时
@@ -100,6 +51,9 @@ def main():
         
         # 初始化小地图导航
         map_bot = MapReader()
+        
+        # 初始化碰撞预警系统
+        collision_monitor = CollisionMonitor(expansion_threshold=1.05, history_len=5)
         
         # 控制器
         controller = PIDController(Kp=KP, steering_threshold=STEERING_THRESHOLD, turn_cooldown=TURN_COOLDOWN)
@@ -148,10 +102,20 @@ def main():
         detections = yolo_bot.detect(frame)
         
         # --- 碰撞风险检测 (使用动态 ROI) ---
-        # 使用 lane_info 中的 offset_y 作为刹车线高度
-        # 如果 offset_y 存在，则刹车线与车道中心点高度一致
-        dynamic_brake_y = lane_info.get('offset_y', None)
-        is_danger, danger_obj, current_roi = check_danger(detections, current_lane_center_x, brake_line_y=dynamic_brake_y)
+        # 动态计算 ROI X 范围
+        roi_x_min = current_lane_center_x - (ROI_CONFIG['lane_width'] // 2)
+        roi_x_max = current_lane_center_x + (ROI_CONFIG['lane_width'] // 2)
+        roi_x_min = max(0, roi_x_min)
+        roi_x_max = min(VIEW_WIDTH, roi_x_max)
+        
+        current_roi = {
+            'x_min': int(roi_x_min),
+            'x_max': int(roi_x_max),
+            'y_min': ROI_CONFIG['y_min'],
+            'y_max': ROI_CONFIG['y_max']
+        }
+        
+        is_danger, danger_obj, debug_info = collision_monitor.update(detections, current_roi)
         
         # 可视化危险区域 (动态跟随车道)
         roi_color = (0, 0, 255) if is_danger else (0, 255, 0) # 红/绿
@@ -160,20 +124,26 @@ def main():
                       (current_roi['x_max'], current_roi['y_max']), 
                       roi_color, 2)
         
-        # 可视化刹车线 (蓝色虚线)
-        brake_y = current_roi['brake_line']
-        cv2.line(result_frame, (current_roi['x_min'], brake_y), (current_roi['x_max'], brake_y), (255, 255, 0), 2)
-        cv2.putText(result_frame, "BRAKE LINE", (current_roi['x_min'], brake_y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-        
         if is_danger:
-             cv2.putText(result_frame, f"WARNING: {danger_obj['label']} TOO CLOSE!", (current_roi['x_min'], current_roi['y_min']-10), 
+             cv2.putText(result_frame, f"WARNING: COLLISION RISK!", (current_roi['x_min'], current_roi['y_min']-10), 
                          cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+        # 显示调试信息 (膨胀率等)
+        for i, msg in enumerate(debug_info):
+             cv2.putText(result_frame, msg, (10, 350 + i*20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
         for det in detections:
             x1, y1, x2, y2 = det['bbox']
             label = f"{det['label']} {det['conf']:.2f}"
+            
             # 如果是导致危险的物体，用红色高亮
-            color = (0, 0, 255) if (is_danger and det == danger_obj) else (0, 165, 255)
+            is_danger_target = False
+            if is_danger and danger_obj:
+                 d_bbox = danger_obj['bbox']
+                 if x1 == d_bbox[0] and y1 == d_bbox[1]:
+                     is_danger_target = True
+            
+            color = (0, 0, 255) if is_danger_target else (0, 165, 255)
             
             # 画框
             cv2.rectangle(result_frame, (x1, y1), (x2, y2), color, 2)
