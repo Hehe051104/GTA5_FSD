@@ -128,12 +128,12 @@ class CollisionMonitor:
             # 0.6 * 570 = 342 (屏幕中部)
             # 0.8 * 570 = 456 (屏幕中下部)
             
-            # 警告距离：进入中距离范围
-            is_in_warning_zone = curr_y > (lane_roi['y_max'] * 0.6) 
+            # 警告距离：进入中距离范围 (0.55 = 55% 高度)
+            is_in_warning_zone = curr_y > (lane_roi['y_max'] * 0.55) 
             
             # 刹车距离：进入近距离范围 (强制刹车)
-            # 降低阈值，使其更敏感。只要物体底部超过 ROI 高度的 75%，就视为必须刹车
-            is_in_brake_zone = curr_y > (lane_roi['y_max'] * 0.75)
+            # [修改] 提高灵敏度：只要物体底部超过 ROI 高度的 65%，就视为必须刹车
+            is_in_brake_zone = curr_y > (lane_roi['y_max'] * 0.65)
             
             debug_msg = f"ID:{obj_id} R:{expansion_rate:.2f} Y:{curr_y}"
             debug_info.append(debug_msg)

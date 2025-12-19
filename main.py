@@ -8,6 +8,7 @@ from utils.screen_grab import ScreenGrabber
 from modules.perception.yolop_service import YOLOPService # New SOTA YOLOPv2
 from modules.perception.yolo_service import YoloService   # YOLOv8 Object Detection
 from modules.perception.map_reader import MapReader       # Minimap Navigation
+from modules.perception.stuck_detector import StuckDetector # Visual Stuck Detection
 from modules.perception.collision_monitor import CollisionMonitor # Collision Warning
 from modules.control.pid_controller import PIDController
 from utils.directkeys import press_key_by_name, release_key_by_name
@@ -18,23 +19,28 @@ VIEW_HEIGHT = 720
 
 # --- 转向阈值配置 ---
 # 视觉车道保持阈值: 降低到 60 以提供更灵敏的修正，防止大幅度画龙
-STEERING_THRESHOLD_LANE = 120
+STEERING_THRESHOLD_LANE = 140
 # 小地图导航阈值: 保持灵敏
-STEERING_THRESHOLD_MAP = 20    
+STEERING_THRESHOLD_MAP = 30
+
+# --- 偏移量偏置 (Lane Bias) ---
+# 正值 = 强制车身向右靠 (单位: 像素)
+# 解决 YOLOP 识别整条路导致压黄线的问题
+LANE_OFFSET_BIAS = 40
 
 # --- PID 控制器参数 ---
 KP = 0.005  
 # 冷却时间: 降低到 0.2s，允许更频繁的微调
-TURN_COOLDOWN = 0.2 
+TURN_COOLDOWN = 0.3
 ENABLE_AUTOPILOT = True 
 
 # --- 危险区域配置 (ROI) ---
 # 动态 ROI 配置
 ROI_CONFIG = {
-    'lane_width': 350,              # 车道宽度 (像素)
+    'lane_width': 400,              # [修改] 适度加宽 (350 -> 400)，避免误检对向车道
     'y_min': VIEW_HEIGHT // 2 - 50, # 地平线附近 (远端)
     'y_max': VIEW_HEIGHT - 150,     # 仪表盘上方 (近端)
-    'brake_threshold': 0.55         # 刹车距离阈值 (0.0-1.0): 物体底部超过屏幕高度的 55% 时刹车
+    'brake_threshold': 0.65         # [修改] 刹车距离阈值 (更远就开始刹车)
 }
 # ===========================================
 
@@ -58,6 +64,9 @@ def main():
         
         # 初始化小地图导航
         map_bot = MapReader()
+        
+        # 初始化卡死检测器
+        stuck_bot = StuckDetector(stuck_threshold=2.0)
         
         # 初始化碰撞预警系统
         collision_monitor = CollisionMonitor(expansion_threshold=1.05, history_len=5)
@@ -111,6 +120,10 @@ def main():
         # 3. YOLOv8 物体检测
         # 在 YOLOPv2 的结果上叠加检测框
         detections = yolo_bot.detect(frame)
+        
+        # --- 卡死检测 (机器视觉) ---
+        # 传入当前帧和当前按下的按键
+        is_stuck, is_recovering = stuck_bot.update(frame, current_speed_key)
         
         # --- 碰撞风险检测 (使用动态 ROI) ---
         # 动态计算 ROI X 范围
@@ -199,7 +212,8 @@ def main():
                 if is_on_route:
                     # 场景1.1: 在路线上且前方直行 (On Route + Forward) -> 信任视觉车道保持
                     # 车辆位于紫色导航线上，且前方有路，优先使用平滑的视觉车道保持
-                    final_offset = offset
+                    # [修改] 加上偏移量偏置，强制靠右行驶
+                    final_offset = offset + LANE_OFFSET_BIAS
                     nav_source = "Vision (On Route)"
                     should_cruise = True
                     controller.steering_threshold = STEERING_THRESHOLD_LANE # 低灵敏度，防画龙
@@ -222,7 +236,8 @@ def main():
             # 无紫线 (到达目的地 或 丢失)
             if endless_mode and has_lane_signal:
                 # 场景3: 无尽模式 (无紫线 + 有车道 + K键激活)
-                final_offset = offset
+                # [修改] 加上偏移量偏置
+                final_offset = offset + LANE_OFFSET_BIAS
                 nav_source = "Vision (Endless)"
                 should_cruise = True
                 # 切换回低灵敏度阈值 (防画龙)
@@ -233,35 +248,46 @@ def main():
                 should_cruise = False # Brake
 
         if autopilot_on:
-            # --- 转向控制 ---
-            # 只有在巡航状态下才进行转向修正，刹车时保持直行以防乱转
-            if should_cruise:
-                # 动态调整最大转向时长 (针对十字路口急转弯)
-                # 如果偏移量巨大 (>200)，说明是急弯，允许更长的按键时间 (0.6s)
-                # 否则使用默认的微调时间 (0.15s)
-                max_turn_duration = 0.6 if abs(final_offset) > 200 else 0.15
-                action_steer = controller.get_action(final_offset, max_duration=max_turn_duration)
+            # --- 优先级处理 ---
+            
+            # 优先级 0: 倒车脱困 (最高优先级)
+            if is_recovering:
+                # 倒车 + 向左打方向 (试图倒出死胡同)
+                target_key = 'S'
+                action_speed = 'RECOVER (Reverse)'
+                # 强制修改转向逻辑
+                action_steer = 'Left (Reverse)'
+                # 简单粗暴：直接按 A，并确保 D 松开
+                release_key_by_name('D')
+                press_key_by_name('A') 
+            
             else:
-                action_steer = 'Straight'
+                # 正常转向逻辑
+                # 只有在巡航状态下才进行转向修正，刹车时保持直行以防乱转
+                if should_cruise:
+                    # 动态调整最大转向时长 (针对十字路口急转弯)
+                    # 如果偏移量巨大 (>200)，说明是急弯，允许更长的按键时间 (0.6s)
+                    # 否则使用默认的微调时间 (0.15s)
+                    max_turn_duration = 0.6 if abs(final_offset) > 200 else 0.15
+                    action_steer = controller.get_action(final_offset, max_duration=max_turn_duration)
+                else:
+                    action_steer = 'Straight'
+                
+                # 正常速度逻辑
+                if is_danger:
+                    # 碰撞预警优先级最高
+                    target_key = 'SPACE'
+                    action_speed = 'BRAKE (Danger)'
+                elif should_cruise:
+                    # 始终保持动力 (按住 W)，即使是急转弯
+                    target_key = 'W'
+                    action_speed = 'CRUISE'
+                else:
+                    # 导航逻辑要求的停车
+                    target_key = 'SPACE'
+                    action_speed = 'BRAKE (Nav Logic)'
             
-            # --- 速度控制 (ACC) ---
-            target_key = 'W' # 默认
-            
-            if is_danger:
-                # 碰撞预警优先级最高
-                target_key = 'SPACE'
-                action_speed = 'BRAKE (Danger)'
-            elif should_cruise:
-                # 始终保持动力 (按住 W)，即使是急转弯
-                # 之前的逻辑会在急转弯时按 S 导致停车，现已移除
-                target_key = 'W'
-                action_speed = 'CRUISE'
-            else:
-                # 导航逻辑要求的停车
-                target_key = 'SPACE'
-                action_speed = 'BRAKE (Nav Logic)'
-            
-            # 执行按键切换
+            # 执行按键切换 (速度控制)
             if target_key != current_speed_key:
                 if current_speed_key:
                     release_key_by_name(current_speed_key)
@@ -311,6 +337,10 @@ def main():
         # 显示无尽模式状态
         endless_color = (0, 255, 0) if endless_mode else (100, 100, 100)
         cv2.putText(result_frame, f'Endless Mode [K]: {"ON" if endless_mode else "OFF"}', (10, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.6, endless_color, 2)
+
+        # 显示卡死状态
+        if is_recovering:
+            cv2.putText(result_frame, "STUCK DETECTED! REVERSING...", (VIEW_WIDTH//2 - 200, VIEW_HEIGHT//2), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
 
         # 显示主窗口
         cv2.imshow('GTA5 FSD - Turbo', result_frame)
