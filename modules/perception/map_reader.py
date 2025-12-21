@@ -23,8 +23,8 @@ class MapReader:
 
         car_center_x = map_w // 2
         # Adjust car center Y to align with the player arrow
-        # Moved up to 0.50 (Center) based on user feedback
-        car_center_y = int(map_h * 0.50)
+        # Moved to 0.55 based on user feedback
+        car_center_y = int(map_h * 0.55)
 
         hsv = cv2.cvtColor(minimap, cv2.COLOR_BGR2HSV)
         
@@ -57,6 +57,32 @@ class MapReader:
         
         mask_forward_check = cv2.bitwise_and(mask_nav_full, mask_forward)
         forward_pixels = cv2.countNonZero(mask_forward_check)
+        
+        # --- B. Check Upcoming Turn (Lookahead for Deceleration) ---
+        # Check a region FURTHER ahead to detect if the straight path ends (approaching turn)
+        # [修改] 缩短前瞻距离 (2.5 -> 1.8)，避免过早减速导致停车
+        lookahead_start_y = car_center_y - int(pursuit_radius * 1.8)
+        lookahead_end_y = car_center_y - pursuit_radius
+        
+        mask_lookahead = np.zeros_like(mask_nav_full)
+        cv2.rectangle(mask_lookahead,
+                      (car_center_x - forward_width, lookahead_start_y),
+                      (car_center_x + forward_width, lookahead_end_y),
+                      255, -1)
+        
+        mask_lookahead_check = cv2.bitwise_and(mask_nav_full, mask_lookahead)
+        lookahead_pixels = cv2.countNonZero(mask_lookahead_check)
+        
+        # If we have path NOW (forward_pixels > 20) but NO path AHEAD (lookahead_pixels < 10),
+        # it means a turn is coming up soon! -> SLOW DOWN
+        is_turn_ahead = (forward_pixels > 20) and (lookahead_pixels < 10)
+        
+        if is_turn_ahead:
+             # Visual Debug: Show Lookahead ROI in Red (Warning)
+             cv2.rectangle(minimap,
+                      (car_center_x - forward_width, lookahead_start_y),
+                      (car_center_x + forward_width, lookahead_end_y),
+                      (0, 0, 255), 1)
         
         nav_error = None
         active_mask_points = None
@@ -152,4 +178,4 @@ class MapReader:
         status_color = (0, 255, 0) if is_on_route else (0, 0, 255)
         cv2.circle(minimap, (car_center_x, car_center_y), 4, status_color, -1)
 
-        return nav_error, is_on_route, mode, minimap
+        return nav_error, is_on_route, mode, minimap, is_turn_ahead

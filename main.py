@@ -26,7 +26,7 @@ STEERING_THRESHOLD_MAP = 30
 # --- 偏移量偏置 (Lane Bias) ---
 # 正值 = 强制车身向右靠 (单位: 像素)
 # 解决 YOLOP 识别整条路导致压黄线的问题
-LANE_OFFSET_BIAS = 40
+LANE_OFFSET_BIAS = 20
 
 # --- PID 控制器参数 ---
 KP = 0.005  
@@ -93,8 +93,14 @@ def main():
     endless_mode = False
     k_key_pressed = False
 
+    # FPS 平滑
+    fps_ema = None
+    fps_alpha = 0.1
+    frame_counter = 0
+
     while True:
         t0 = time.time()
+        frame_counter += 1
         
         # 1. 获取屏幕
         raw_frame = grabber.get_frame()
@@ -115,7 +121,7 @@ def main():
         
         # --- 小地图导航处理 ---
         # 注意：map_bot 需要原始分辨率的帧来截取小地图区域
-        nav_offset, is_on_route, nav_mode, minimap_vis = map_bot.process(raw_frame)
+        nav_offset, is_on_route, nav_mode, minimap_vis, is_turn_ahead = map_bot.process(raw_frame)
         
         # 3. YOLOv8 物体检测
         # 在 YOLOPv2 的结果上叠加检测框
@@ -278,6 +284,16 @@ def main():
                     # 碰撞预警优先级最高
                     target_key = 'SPACE'
                     action_speed = 'BRAKE (Danger)'
+                elif is_turn_ahead and should_cruise:
+                    # [修改] 蠕行逻辑 (Creep Mode)
+                    # 防止因之前刹车导致车辆完全停止
+                    # 策略: 提高动力到 60% (每 10 帧给 6 帧油)，确保有足够动力进弯
+                    if (frame_counter % 10) < 6:
+                        target_key = 'W'
+                        action_speed = 'SLOW (Creep 60%)'
+                    else:
+                        target_key = None 
+                        action_speed = 'SLOW (Coast)'
                 elif should_cruise:
                     # 始终保持动力 (按住 W)，即使是急转弯
                     target_key = 'W'
@@ -291,7 +307,10 @@ def main():
             if target_key != current_speed_key:
                 if current_speed_key:
                     release_key_by_name(current_speed_key)
-                press_key_by_name(target_key)
+                
+                if target_key: # Only press if key is not None
+                    press_key_by_name(target_key)
+                
                 current_speed_key = target_key
         else:
             action_steer = 'Manual'
